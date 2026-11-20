@@ -24,27 +24,52 @@ class InputEngine:
 
     def find_bloody_event_node(self):
         """Encontra o arquivo /dev/input/eventX correspondente ao mouse Bloody."""
+        import re
+
+        # Método 1: Leitura direta de /proc/bus/input/devices (sempre funciona)
+        try:
+            if os.path.exists("/proc/bus/input/devices"):
+                with open("/proc/bus/input/devices", "r") as f:
+                    content = f.read()
+                sections = content.strip().split("\n\n")
+                for sec in sections:
+                    sec_lower = sec.lower()
+                    if ("09da" in sec_lower or "company  usb device" in sec_lower or "bloody" in sec_lower or "a4tech" in sec_lower):
+                        if "mouse" in sec_lower:
+                            m = re.search(r"Handlers=.*?(event\d+)", sec)
+                            if m:
+                                path = f"/dev/input/{m.group(1)}"
+                                if os.path.exists(path):
+                                    return path
+        except Exception as e:
+            print(f"[Engine] Erro ao ler /proc/bus/input/devices: {e}")
+
+        # Método 2: Verificação por link simbólico em /dev/input/by-id
+        try:
+            for item in os.listdir("/dev/input/by-id"):
+                item_lower = item.lower()
+                if ("company_usb_device" in item_lower or "bloody" in item_lower or "a4tech" in item_lower) and "event-mouse" in item_lower:
+                    full = os.path.realpath(os.path.join("/dev/input/by-id", item))
+                    if os.path.exists(full):
+                        return full
+        except Exception:
+            pass
+
+        # Método 3: Fallback varrendo dispositivos evdev
         try:
             import evdev
-            devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
-            
-            # 1. Procura por VID 09DA
-            for dev in devices:
-                if dev.info.vendor == 0x09DA:
-                    # Preferência pelo nó que emite eventos de mouse (REL_X / REL_Y)
-                    caps = dev.capabilities()
-                    if evdev.ecodes.EV_REL in caps and evdev.ecodes.REL_X in caps[evdev.ecodes.EV_REL]:
-                        return dev.path
-            
-            # 2. Fallback: Procura por nome com 'COMPANY' ou 'Bloody' ou 'A4Tech'
-            for dev in devices:
-                name = dev.name.lower()
-                if "bloody" in name or "a4tech" in name or "company  usb device" in name:
-                    caps = dev.capabilities()
-                    if evdev.ecodes.EV_REL in caps:
-                        return dev.path
+            for path in evdev.list_devices():
+                try:
+                    dev = evdev.InputDevice(path)
+                    if dev.info.vendor == 0x09DA:
+                        caps = dev.capabilities()
+                        if evdev.ecodes.EV_REL in caps and evdev.ecodes.REL_X in caps[evdev.ecodes.EV_REL]:
+                            return dev.path
+                except Exception:
+                    continue
         except Exception as e:
-            print(f"[Engine] Erro ao listar dispositivos evdev: {e}")
+            print(f"[Engine] Erro no fallback evdev: {e}")
+
         return None
 
     def start(self):
@@ -60,7 +85,23 @@ class InputEngine:
 
         node_path = self.find_bloody_event_node()
         if not node_path:
-            return False, "Mouse Bloody não encontrado em /dev/input/. Verifique conexão USB e permissões udev."
+            return False, "Mouse Bloody não encontrado em /dev/input/. Verifique se o mouse está conectado."
+
+        # Verifica permissão de leitura no nó do mouse
+        if not os.access(node_path, os.R_OK):
+            return False, (
+                f"Permissão negada no mouse ({node_path})!\n\n"
+                f"Para liberar, execute no terminal do VS Code:\n"
+                f"sudo chmod 666 {node_path} /dev/uinput"
+            )
+
+        # Verifica permissão de gravação no uinput
+        if os.path.exists("/dev/uinput") and not os.access("/dev/uinput", os.W_OK):
+            return False, (
+                "Permissão negada no /dev/uinput!\n\n"
+                "Para liberar, execute no terminal do VS Code:\n"
+                "sudo chmod 666 /dev/uinput"
+            )
 
         try:
             self.mouse_device = evdev.InputDevice(node_path)
@@ -82,7 +123,11 @@ class InputEngine:
             self.worker_thread.start()
             return True, f"Engine ativa no nó {node_path} com uinput!"
         except PermissionError:
-            return False, "Permissão negada ao acessar /dev/uinput ou o mouse. Instale a regra: sudo cp 99-bloody.rules /etc/udev/rules.d/"
+            return False, (
+                f"Permissão negada!\n\n"
+                f"Execute no terminal do VS Code:\n"
+                f"sudo chmod 666 {node_path} /dev/uinput"
+            )
         except Exception as e:
             return False, f"Falha ao iniciar engine: {e}"
 
