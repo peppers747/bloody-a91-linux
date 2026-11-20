@@ -1,0 +1,12 @@
+# Regras udev para dispositivos A4Tech Bloody (Vendor ID: 09da)
+# Permite acesso ao /dev/uinput e ao mouse sem necessidade de rodar como root/sudo
+
+# 1. Permissão de criação de dispositivos virtuais via uinput
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput", MODE="0660", GROUP="input"
+
+# 2. Acesso USB direto para controle de LED / Iluminação
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="09da", TAG+="uaccess", MODE="0666", GROUP="input"
+
+# 3. Acesso aos nós HID e Eventos do mouse Bloody
+KERNEL=="hidraw*", ATTRS{idVendor}=="09da", TAG+="uaccess", MODE="0666", GROUP="input"
+KERNEL=="event*", SUBSYSTEM=="input", ATTRS{idVendor}=="09da", TAG+="uaccess", MODE="0660", GROUP="input"
