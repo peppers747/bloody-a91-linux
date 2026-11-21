@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=BloodyLinux
+GenericName=Configurador de Mouse Bloody
+Comment=Controlador do mouse A4Tech Bloody A91 (no-recoil, rajada, auto-clicker, LEDs)
+Exec=bloodylinux
+Icon=bloodylinux
+Terminal=false
+Categories=Settings;HardwareSettings;Utility;
+Keywords=mouse;bloody;a4tech;a91;recoil;
+StartupNotify=true

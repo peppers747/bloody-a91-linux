@@ -1,0 +1,14 @@
+# Ambientes virtuais
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Configuração local do usuário (agora fica em ~/.config/bloodylinux)
+config.json
+
+# Artefatos de build
+dist/
+build/

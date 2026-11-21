@@ -1,292 +1,357 @@
-import time
-import threading
-import random
 import os
+import random
+import re
+import select
+import threading
+import time
+from collections import deque
+
+A4TECH_VID = 0x09DA
+VIRTUAL_DEVICE_NAME = "BloodyLinux Virtual Mouse"
+
+# Botões que podem ser usados como gatilho do auto-clicker (nome evdev -> rótulo na GUI)
+AUTOCLICK_TRIGGERS = {
+    "BTN_SIDE": "Botão lateral traseiro",
+    "BTN_EXTRA": "Botão lateral dianteiro",
+    "BTN_MIDDLE": "Botão do meio (scroll)",
+}
+
 
 class InputEngine:
+    """
+    Captura o mouse físico (evdev, com grab exclusivo) e repassa os eventos para um
+    mouse virtual (uinput), aplicando os modos Core 1/2/3 e o auto-clicker.
+    """
+
     def __init__(self, config_manager):
         self.cfg = config_manager
         self.running = False
+        self.last_error = None
+        self.node_path = None
         self.mouse_device = None
         self.uinput_device = None
         self.worker_thread = None
-        self.recoil_thread = None
-        
-        # Estado atual
+
+        self._write_lock = threading.Lock()
+        self._press_id = 0          # incrementa a cada clique; invalida threads de recoil antigas
+        self._burst_busy = False
+        self._autoclick_holding = False
+        self._lmb_forwarded = False
+
         self.lmb_pressed = False
-        self.active_burst_mode = 1  # 1: single, 2: N-burst, 3: 3-burst
-        self.autoclicker_active = False
-        self.autoclicker_thread = None
-        
-        # Estatísticas para o benchmark de CPS
-        self.click_timestamps = []
-        self.last_cps = 0.0
+        self.click_timestamps = deque()
+
+    # ------------------------------------------------------------------
+    # Descoberta do dispositivo
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_pointer(dev, ecodes):
+        caps = dev.capabilities()
+        return (ecodes.REL_X in caps.get(ecodes.EV_REL, [])
+                and ecodes.BTN_LEFT in caps.get(ecodes.EV_KEY, []))
 
     def find_bloody_event_node(self):
-        """Encontra o arquivo /dev/input/eventX correspondente ao mouse Bloody."""
-        import re
-
-        # Método 1: Leitura direta de /proc/bus/input/devices (sempre funciona)
-        try:
-            if os.path.exists("/proc/bus/input/devices"):
-                with open("/proc/bus/input/devices", "r") as f:
-                    content = f.read()
-                sections = content.strip().split("\n\n")
-                for sec in sections:
-                    sec_lower = sec.lower()
-                    if ("09da" in sec_lower or "company  usb device" in sec_lower or "bloody" in sec_lower or "a4tech" in sec_lower):
-                        if "mouse" in sec_lower:
-                            m = re.search(r"Handlers=.*?(event\d+)", sec)
-                            if m:
-                                path = f"/dev/input/{m.group(1)}"
-                                if os.path.exists(path):
-                                    return path
-        except Exception as e:
-            print(f"[Engine] Erro ao ler /proc/bus/input/devices: {e}")
-
-        # Método 2: Verificação por link simbólico em /dev/input/by-id
-        try:
-            for item in os.listdir("/dev/input/by-id"):
-                item_lower = item.lower()
-                if ("company_usb_device" in item_lower or "bloody" in item_lower or "a4tech" in item_lower) and "event-mouse" in item_lower:
-                    full = os.path.realpath(os.path.join("/dev/input/by-id", item))
-                    if os.path.exists(full):
-                        return full
-        except Exception:
-            pass
-
-        # Método 3: Fallback varrendo dispositivos evdev
+        """Encontra o /dev/input/eventX do mouse Bloody (ignorando o próprio mouse virtual)."""
         try:
             import evdev
-            for path in evdev.list_devices():
-                try:
-                    dev = evdev.InputDevice(path)
-                    if dev.info.vendor == 0x09DA:
-                        caps = dev.capabilities()
-                        if evdev.ecodes.EV_REL in caps and evdev.ecodes.REL_X in caps[evdev.ecodes.EV_REL]:
-                            return dev.path
-                except Exception:
-                    continue
-        except Exception as e:
-            print(f"[Engine] Erro no fallback evdev: {e}")
+            from evdev import ecodes
+        except ImportError:
+            return None
 
+        name_fallback = None
+        for path in evdev.list_devices():
+            try:
+                dev = evdev.InputDevice(path)
+            except OSError:
+                continue
+            try:
+                if dev.name == VIRTUAL_DEVICE_NAME or not self._is_pointer(dev, ecodes):
+                    continue
+                if dev.info.vendor == A4TECH_VID:
+                    return dev.path
+                lname = dev.name.lower()
+                if name_fallback is None and ("bloody" in lname or "a4tech" in lname):
+                    name_fallback = dev.path
+            finally:
+                dev.close()
+        if name_fallback:
+            return name_fallback
+
+        # Sem permissão para abrir os nós, evdev não lista nada: tenta /proc para dar
+        # uma mensagem de erro útil (o nó existe, mas falta permissão).
+        try:
+            with open("/proc/bus/input/devices", "r") as f:
+                sections = f.read().strip().split("\n\n")
+            for sec in sections:
+                if "vendor=09da" in sec.lower() and VIRTUAL_DEVICE_NAME not in sec:
+                    m = re.search(r"Handlers=.*\bmouse\d+.*?\b(event\d+)", sec) or \
+                        re.search(r"Handlers=.*?\b(event\d+).*\bmouse\d+", sec)
+                    if m:
+                        return f"/dev/input/{m.group(1)}"
+        except OSError:
+            pass
         return None
 
+    # ------------------------------------------------------------------
+    # Ciclo de vida
+    # ------------------------------------------------------------------
     def start(self):
-        """Inicializa a captura evdev e o dispositivo virtual uinput."""
         if self.running:
             return True, "Engine já está em execução."
 
         try:
             import evdev
-            from evdev import UInput, ecodes
+            from evdev import UInput
         except ImportError:
-            return False, "Biblioteca 'evdev' não instalada. Execute ./setup.sh para instalar dependências."
+            return False, "Biblioteca 'evdev' não instalada. Execute o instalador (install.sh)."
 
         node_path = self.find_bloody_event_node()
         if not node_path:
             return False, "Mouse Bloody não encontrado em /dev/input/. Verifique se o mouse está conectado."
 
-        # Verifica permissão de leitura no nó do mouse
+        perm_hint = (
+            "Instale as regras udev com o instalador (sudo ./install.sh) ou, "
+            "temporariamente:\n"
+            f"sudo chmod 666 {node_path} /dev/uinput"
+        )
         if not os.access(node_path, os.R_OK):
-            return False, (
-                f"Permissão negada no mouse ({node_path})!\n\n"
-                f"Para liberar, execute no terminal do VS Code:\n"
-                f"sudo chmod 666 {node_path} /dev/uinput"
-            )
-
-        # Verifica permissão de gravação no uinput
-        if os.path.exists("/dev/uinput") and not os.access("/dev/uinput", os.W_OK):
-            return False, (
-                "Permissão negada no /dev/uinput!\n\n"
-                "Para liberar, execute no terminal do VS Code:\n"
-                "sudo chmod 666 /dev/uinput"
-            )
+            return False, f"Permissão negada no mouse ({node_path}).\n\n{perm_hint}"
+        if not os.path.exists("/dev/uinput"):
+            return False, "/dev/uinput não existe. Carregue o módulo com: sudo modprobe uinput"
+        if not os.access("/dev/uinput", os.W_OK):
+            return False, f"Permissão negada no /dev/uinput.\n\n{perm_hint}"
 
         try:
             self.mouse_device = evdev.InputDevice(node_path)
-            # Cria dispositivo virtual com suporte a mouse
-            cap = {
-                ecodes.EV_KEY: [ecodes.BTN_LEFT, ecodes.BTN_RIGHT, ecodes.BTN_MIDDLE, ecodes.BTN_SIDE, ecodes.BTN_EXTRA],
-                ecodes.EV_REL: [ecodes.REL_X, ecodes.REL_Y, ecodes.REL_WHEEL, ecodes.REL_HWHEEL]
-            }
-            self.uinput_device = UInput(cap, name="Bloody-Virtual-Core-Mouse")
-            
-            # Tenta capturar o dispositivo de forma exclusiva
-            try:
-                self.mouse_device.grab()
-            except Exception as grab_err:
-                print(f"[Engine] Aviso: grab() falhou ({grab_err}). Operando em modo de injeção complementar.")
-
-            self.running = True
-            self.worker_thread = threading.Thread(target=self._event_loop, daemon=True)
-            self.worker_thread.start()
-            return True, f"Engine ativa no nó {node_path} com uinput!"
+            # Mouse virtual com exatamente os mesmos botões/eixos do físico
+            self.uinput_device = UInput.from_device(self.mouse_device, name=VIRTUAL_DEVICE_NAME)
         except PermissionError:
-            return False, (
-                f"Permissão negada!\n\n"
-                f"Execute no terminal do VS Code:\n"
-                f"sudo chmod 666 {node_path} /dev/uinput"
-            )
+            self._close_devices()
+            return False, f"Permissão negada.\n\n{perm_hint}"
         except Exception as e:
+            self._close_devices()
             return False, f"Falha ao iniciar engine: {e}"
+
+        try:
+            self.mouse_device.grab()
+        except OSError as e:
+            # Sem grab, o sistema receberia os cliques em dobro (físico + virtual).
+            self._close_devices()
+            return False, f"Não foi possível capturar o mouse com exclusividade: {e}"
+
+        self.node_path = node_path
+        self.last_error = None
+        self.lmb_pressed = False
+        self._lmb_forwarded = False
+        self.running = True
+        self.worker_thread = threading.Thread(target=self._event_loop, daemon=True)
+        self.worker_thread.start()
+        return True, f"Engine ativa em {node_path}"
 
     def stop(self):
         self.running = False
         self.lmb_pressed = False
-        self.autoclicker_active = False
+        self._autoclick_holding = False
+        if self.worker_thread and self.worker_thread is not threading.current_thread():
+            self.worker_thread.join(timeout=1.0)
+        self.worker_thread = None
+        self._close_devices()
+
+    def _close_devices(self):
         if self.mouse_device:
             try:
                 self.mouse_device.ungrab()
-            except Exception:
+            except OSError:
+                pass
+            try:
+                self.mouse_device.close()
+            except OSError:
                 pass
             self.mouse_device = None
-        if self.uinput_device:
+        with self._write_lock:
+            if self.uinput_device:
+                try:
+                    # garante que nenhum botão fique "preso" pressionado
+                    self.uinput_device.write(1, 0x110, 0)  # EV_KEY, BTN_LEFT, 0
+                    self.uinput_device.syn()
+                    self.uinput_device.close()
+                except OSError:
+                    pass
+                self.uinput_device = None
+
+    # ------------------------------------------------------------------
+    # Escrita no mouse virtual
+    # ------------------------------------------------------------------
+    def _emit(self, *events, syn=True):
+        """Escreve eventos (type, code, value) de forma thread-safe."""
+        with self._write_lock:
+            dev = self.uinput_device
+            if not dev:
+                return
             try:
-                self.uinput_device.close()
-            except Exception:
+                for etype, code, value in events:
+                    dev.write(etype, code, value)
+                if syn:
+                    dev.syn()
+            except OSError:
                 pass
-            self.uinput_device = None
 
+    # ------------------------------------------------------------------
+    # Loop principal
+    # ------------------------------------------------------------------
     def _event_loop(self):
-        """Loop de captura de eventos do hardware original."""
         from evdev import ecodes
 
-        while self.running and self.mouse_device:
+        trigger_cache = None
+        while self.running:
+            dev = self.mouse_device
+            if dev is None:
+                break
             try:
-                for event in self.mouse_device.read_loop():
-                    if not self.running:
-                        break
-
-                    # Monitora clique esquerdo
-                    if event.type == ecodes.EV_KEY and event.code == ecodes.BTN_LEFT:
-                        if event.value == 1:  # Botão pressionado
-                            self.lmb_pressed = True
-                            self._record_click()
-                            self._handle_lmb_down()
-                        elif event.value == 0:  # Botão solto
-                            self.lmb_pressed = False
-                            if self.uinput_device:
-                                self.uinput_device.write(ecodes.EV_KEY, ecodes.BTN_LEFT, 0)
-                                self.uinput_device.syn()
-
-                    # Repassa movimento e demais botões normalmente
-                    elif self.uinput_device:
-                        self.uinput_device.write(event.type, event.code, event.value)
-                        self.uinput_device.syn()
-
-            except Exception as e:
+                r, _, _ = select.select([dev.fd], [], [], 0.2)
+                if not r:
+                    continue
+                events = list(dev.read())
+            except (OSError, ValueError) as e:
                 if self.running:
-                    print(f"[Engine Loop] Erro: {e}")
-                    time.sleep(0.5)
+                    self.last_error = f"Mouse desconectado ou erro de leitura: {e}"
+                    print(f"[Engine] {self.last_error}")
+                    self.running = False
+                    self._close_devices()
+                break
 
-    def _handle_lmb_down(self):
-        """Trata o clique esquerdo baseado no modo atual (Core 1, 2 ou 3)."""
+            ac_cfg = self.cfg.get("autoclicker", {})
+            ac_enabled = ac_cfg.get("enabled", False)
+            trigger_name = ac_cfg.get("trigger", "BTN_SIDE")
+            if trigger_cache is None or trigger_cache[0] != trigger_name:
+                trigger_cache = (trigger_name, getattr(ecodes, trigger_name, ecodes.BTN_SIDE))
+            trigger_code = trigger_cache[1]
+
+            for ev in events:
+                if ev.type == ecodes.EV_KEY and ev.code == ecodes.BTN_LEFT:
+                    if ev.value == 1:
+                        self._record_click()
+                        self._on_lmb_down()
+                    elif ev.value == 0:
+                        self._on_lmb_up()
+                    continue  # autorepeat (value 2) é descartado
+
+                if ac_enabled and ev.type == ecodes.EV_KEY and ev.code == trigger_code:
+                    if ev.value == 1:
+                        self._start_autoclick_hold()
+                    elif ev.value == 0:
+                        self._autoclick_holding = False
+                    continue  # o gatilho não é repassado ao sistema
+
+                # Todo o resto (movimento, scroll, outros botões e EV_SYN) passa direto
+                self._emit((ev.type, ev.code, ev.value), syn=False)
+
+    # ------------------------------------------------------------------
+    # Clique esquerdo: Core 1 / 2 / 3
+    # ------------------------------------------------------------------
+    def _on_lmb_down(self):
         from evdev import ecodes
+        self.lmb_pressed = True
+        self._press_id += 1
         core_mode = self.cfg.get("core_mode", 1)
 
-        # Core 1: Normal
-        if core_mode == 1:
-            if self.uinput_device:
-                self.uinput_device.write(ecodes.EV_KEY, ecodes.BTN_LEFT, 1)
-                self.uinput_device.syn()
-
-        # Core 2: Burst Fire (Botões 1, N, 3)
-        elif core_mode == 2:
+        if core_mode == 2:
+            if self._burst_busy:
+                return
             burst_cfg = self.cfg.get("burst", {})
-            shots = 1
-            if self.active_burst_mode == 2:
-                shots = burst_cfg.get("mode_n_shots", 2)
-            elif self.active_burst_mode == 3:
-                shots = burst_cfg.get("mode_3_shots", 3)
-            
-            interval = burst_cfg.get("shot_interval_ms", 40) / 1000.0
+            mode = burst_cfg.get("active_mode", 1)
+            shots = {2: burst_cfg.get("mode_n_shots", 2), 3: burst_cfg.get("mode_3_shots", 3)}.get(mode, 1)
+            interval = max(10, burst_cfg.get("shot_interval_ms", 40)) / 1000.0
+            self._burst_busy = True
             threading.Thread(target=self._execute_burst, args=(shots, interval), daemon=True).start()
-
-        # Core 3: Ultra Core / No-Recoil
-        elif core_mode == 3:
-            if self.uinput_device:
-                self.uinput_device.write(ecodes.EV_KEY, ecodes.BTN_LEFT, 1)
-                self.uinput_device.syn()
-
-            recoil_cfg = self.cfg.get("recoil", {})
-            if recoil_cfg.get("enabled", True):
-                threading.Thread(target=self._execute_recoil, daemon=True).start()
-
-    def _execute_burst(self, shots, interval):
-        """Dispara uma rajada precisa de tiros."""
-        from evdev import ecodes
-        if not self.uinput_device:
             return
 
-        for _ in range(shots):
-            self.uinput_device.write(ecodes.EV_KEY, ecodes.BTN_LEFT, 1)
-            self.uinput_device.syn()
-            time.sleep(interval / 2.0)
-            self.uinput_device.write(ecodes.EV_KEY, ecodes.BTN_LEFT, 0)
-            self.uinput_device.syn()
-            time.sleep(interval / 2.0)
+        self._emit((ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        self._lmb_forwarded = True
+        if core_mode == 3 and self.cfg.get("recoil", {}).get("enabled", True):
+            threading.Thread(target=self._execute_recoil, args=(self._press_id,), daemon=True).start()
 
-    def _execute_recoil(self):
-        """Thread responsável pela compensação contínua de recuo (pull-down)."""
+    def _on_lmb_up(self):
+        from evdev import ecodes
+        self.lmb_pressed = False
+        # Só solta se o clique foi repassado (no Core 2 a rajada controla os próprios eventos).
+        # Usar a flag em vez do modo atual evita botão preso se o modo mudar com o botão segurado.
+        if self._lmb_forwarded:
+            self._lmb_forwarded = False
+            self._emit((ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+
+    def _execute_burst(self, shots, interval):
+        from evdev import ecodes
+        try:
+            for _ in range(shots):
+                if not self.running:
+                    break
+                self._emit((ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+                time.sleep(interval / 2.0)
+                self._emit((ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+                time.sleep(interval / 2.0)
+        finally:
+            self._burst_busy = False
+
+    def _execute_recoil(self, press_id):
+        """Compensação contínua de recuo enquanto o botão segue pressionado."""
         from evdev import ecodes
         recoil_cfg = self.cfg.get("recoil", {})
         start_delay = recoil_cfg.get("start_delay_ms", 100) / 1000.0
-        pull_y = recoil_cfg.get("pull_y", 6)
-        pull_x = recoil_cfg.get("pull_x", 0)
-        delay = recoil_cfg.get("delay_ms", 25) / 1000.0
+        pull_y = int(recoil_cfg.get("pull_y", 6))
+        pull_x = int(recoil_cfg.get("pull_x", 0))
+        delay = max(5, recoil_cfg.get("delay_ms", 25)) / 1000.0
 
-        # Espera o delay do tiro inicial
-        time.sleep(start_delay)
+        def still_holding():
+            return self.running and self.lmb_pressed and press_id == self._press_id
 
-        while self.running and self.lmb_pressed and self.uinput_device:
-            # Emite deslocamento relativo vertical e horizontal
-            if pull_y != 0:
-                self.uinput_device.write(ecodes.EV_REL, ecodes.REL_Y, pull_y)
-            if pull_x != 0:
-                self.uinput_device.write(ecodes.EV_REL, ecodes.REL_X, pull_x)
-            self.uinput_device.syn()
+        deadline = time.monotonic() + start_delay
+        while still_holding() and time.monotonic() < deadline:
+            time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+
+        while still_holding():
+            events = []
+            if pull_y:
+                events.append((ecodes.EV_REL, ecodes.REL_Y, pull_y))
+            if pull_x:
+                events.append((ecodes.EV_REL, ecodes.REL_X, pull_x))
+            if events:
+                self._emit(*events)
             time.sleep(delay)
 
-    def start_autoclicker(self, cps=20, jitter=True):
-        """Ativa o auto-clicker com taxa de CPS configurável."""
-        if self.autoclicker_active:
+    # ------------------------------------------------------------------
+    # Auto-clicker (segurar o botão gatilho)
+    # ------------------------------------------------------------------
+    def _start_autoclick_hold(self):
+        if self._autoclick_holding:
             return
-        self.autoclicker_active = True
-        self.autoclicker_thread = threading.Thread(target=self._autoclicker_loop, args=(cps, jitter), daemon=True)
-        self.autoclicker_thread.start()
+        self._autoclick_holding = True
+        threading.Thread(target=self._autoclicker_loop, daemon=True).start()
 
-    def stop_autoclicker(self):
-        self.autoclicker_active = False
-
-    def _autoclicker_loop(self, cps, jitter):
+    def _autoclicker_loop(self):
         from evdev import ecodes
-        base_delay = 1.0 / max(1, cps)
-        
-        while self.running and self.autoclicker_active and self.uinput_device:
-            sleep_time = base_delay / 2.0
-            if jitter:
-                sleep_time += random.uniform(-0.003, 0.003)
-                sleep_time = max(0.005, sleep_time)
-
-            self.uinput_device.write(ecodes.EV_KEY, ecodes.BTN_LEFT, 1)
-            self.uinput_device.syn()
+        while self.running and self._autoclick_holding:
+            ac_cfg = self.cfg.get("autoclicker", {})
+            half = 1.0 / max(1, ac_cfg.get("cps", 18)) / 2.0
+            if ac_cfg.get("randomize_jitter", True):
+                half = max(0.004, half + random.uniform(-0.003, 0.003))
+            self._emit((ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
             self._record_click()
-            time.sleep(sleep_time)
+            time.sleep(half)
+            self._emit((ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+            time.sleep(half)
 
-            self.uinput_device.write(ecodes.EV_KEY, ecodes.BTN_LEFT, 0)
-            self.uinput_device.syn()
-            time.sleep(sleep_time)
-
+    # ------------------------------------------------------------------
+    # Estatísticas
+    # ------------------------------------------------------------------
     def _record_click(self):
-        """Registra timestamps dos cliques para cálculo de CPS em tempo real."""
-        now = time.time()
+        now = time.monotonic()
         self.click_timestamps.append(now)
-        # Mantém apenas o último segundo
-        self.click_timestamps = [t for t in self.click_timestamps if now - t <= 1.0]
-        self.last_cps = len(self.click_timestamps)
+        while self.click_timestamps and now - self.click_timestamps[0] > 1.0:
+            self.click_timestamps.popleft()
 
     def get_current_cps(self):
-        now = time.time()
-        self.click_timestamps = [t for t in self.click_timestamps if now - t <= 1.0]
+        now = time.monotonic()
+        while self.click_timestamps and now - self.click_timestamps[0] > 1.0:
+            self.click_timestamps.popleft()
         return len(self.click_timestamps)

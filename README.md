@@ -1,93 +1,94 @@
 # 🩸 BloodyLinux - Controlador A4Tech Bloody A91 para Linux
 
-Suíte completa em Python para mouses **A4Tech Bloody A91** no Linux, com os mesmos recursos essenciais do software oficial (**Bloody 5 / 6 / 7 / Oscar**):
+Suíte em Python para mouses **A4Tech Bloody A91** no Linux, com os recursos essenciais do software oficial (**Bloody 5 / 6 / 7**):
 
-- 🎯 **Ultra-Core 3 & 4 (No-Recoil / Compensação de Recuo)**: Controle de spray dinâmico vertical (Y) e horizontal (X), delay inicial e presets de armas (CS2, Rust, etc.).
-- ⚡ **Core 2 (Burst Fire / Rajada)**: Modos 1 (tiro simples), N (2 tiros rápidos) e 3 (3 tiros rápidos).
-- 🖱️ **Auto-Clicker & Drag Click Simulator**: Simulador de cliques ultra rápidos com taxa ajustável (10 a 50+ CPS) e variação milimétrica (jitter).
-- 💡 **Controle de Iluminação**: Ajuste de intensidade de luz dos LEDs (desligado, baixo, médio, forte) via USB direto.
-- ⏱️ **CPS & Benchmark em Tempo Real**: Medidor interativo de cliques por segundo e latência para testes de butterfly e drag click.
-- 🎨 **Interface Gamer Moderna**: Desenvolvida em CustomTkinter com visual esportivo vermelho e preto da Bloody.
+- 🎯 **Ultra-Core 3 (No-Recoil)**: compensação vertical (Y) e horizontal (X), atraso do primeiro disparo e presets de armas editáveis.
+- ⚡ **Core 2 (Burst Fire)**: modos 1 (tiro simples), N e 3, com número de tiros e intervalo ajustáveis.
+- 🖱️ **Auto-Clicker**: segure um botão gatilho (lateral ou do meio) para clicar de 5 a 50 CPS, com jitter opcional.
+- 💡 **Iluminação (experimental)**: intensidade dos LEDs via USB.
+- ⏱️ **Medidor de CPS** para testes de butterfly / drag click.
 
 ---
 
-## 🚀 Como Abrir e Rodar no VS Code
+## 📦 Instalação
 
-### Passo 1: Abrir a pasta no VS Code
-No seu terminal Linux, execute:
+### Opção 1 — Pacote `.deb` (Ubuntu, Debian, Mint, Pop!_OS)
+Baixe o `bloodylinux_<versão>_all.deb` na página de **Releases** (ou nos artefatos da aba **Actions**) e rode:
 ```bash
-code /home/peppers/.gemini/antigravity/scratch/bloody-linux
+sudo apt install ./bloodylinux_*_all.deb
 ```
-*(Ou abra o VS Code e vá em **File > Open Folder** e selecione esta pasta).*
 
----
-
-### Passo 2: Executar o Instalador de Ambiente
-Abra o terminal integrado do VS Code (`Ctrl + ~` ou `Terminal > New Terminal`) e execute:
+### Opção 2 — Instalador universal (qualquer distro)
+Funciona em Debian/Ubuntu, Fedora, Arch/Manjaro e openSUSE:
 ```bash
-./setup.sh
+tar xzf bloodylinux-*.tar.gz      # ou clone o repositório
+cd bloodylinux-*
+sudo ./install.sh
 ```
-Esse script cria o ambiente virtual Python (`venv`) e instala todas as dependências (`customtkinter`, `evdev`, `pyusb`, `pillow`).
+O instalador:
+1. instala as dependências do sistema (Python, Tk, evdev, pyusb, libusb);
+2. copia o app para `/opt/bloodylinux` e cria um ambiente Python isolado;
+3. cria o comando `bloodylinux` e o atalho no menu de aplicativos;
+4. instala as regras udev e ativa o módulo `uinput` (sem precisar de sudo para usar o app).
+
+Depois é só abrir **BloodyLinux** no menu. Se o mouse já estava conectado durante a instalação, desconecte e reconecte uma vez.
+
+**Desinstalar:** `sudo /opt/bloodylinux/uninstall.sh` (adicione `--purge` para apagar também suas configurações), ou `sudo apt remove bloodylinux` no caso do `.deb`.
+
+As configurações ficam em `~/.config/bloodylinux/config.json`.
 
 ---
 
-### Passo 3: Configurar as Regras udev (Acesso sem Root)
-Para que o software consiga ler o mouse e criar o dispositivo virtual de macros (`/dev/uinput`) **sem você precisar rodar o VS Code como root/sudo**, execute uma única vez no terminal:
+## 🧑‍💻 Desenvolvimento (VS Code)
 
 ```bash
-# 1. Copia a regra udev
-sudo cp 99-bloody.rules /etc/udev/rules.d/
-
-# 2. Recarrega as regras do sistema
+./setup.sh                      # cria o venv/ com as dependências
+sudo cp 70-bloodylinux.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
-
-# 3. Adiciona seu usuário aos grupos necessários
-sudo usermod -aG input $USER
+./venv/bin/python main.py       # ou F5 no VS Code
 ```
-*(Após rodar o comando acima, se for a primeira vez que você entra no grupo `input`, encerre a sessão do usuário e entre novamente para o Linux atualizar as permissões).*
+
+### Gerar os pacotes
+- **Local:** `bash packaging/build-deb.sh` → `dist/bloodylinux_<versão>_all.deb` (precisa de `dpkg-deb`).
+- **GitHub Actions:** todo push em `main` gera o `.deb` e o `.tar.gz` como artefatos do workflow **Build**. Ao criar uma tag `v*` (ex.: `git tag v1.1.0 && git push --tags`), eles são publicados automaticamente em uma Release.
+
+A versão fica em [src/__init__.py](src/__init__.py).
 
 ---
 
-### Passo 4: Executar no VS Code
-Existem duas formas fáceis:
-1. **Via Tecla F5**: Pressione **F5** no VS Code. O arquivo `.vscode/launch.json` já está pronto e iniciará o `main.py` diretamente no ambiente virtual!
-2. **Via Terminal**:
-   ```bash
-   ./venv/bin/python main.py
-   ```
+## 🔐 Permissões
+
+O arquivo [70-bloodylinux.rules](70-bloodylinux.rules) libera `/dev/uinput` e o mouse para o **usuário logado na sessão** (`TAG+="uaccess"`) e para o grupo `input`, com modo `0660`. O prefixo `70-` é necessário: a tag `uaccess` só tem efeito se for aplicada antes do `73-seat-late.rules` do systemd.
+
+Em sistemas sem systemd-logind, adicione seu usuário ao grupo `input` (`sudo usermod -aG input $USER`) e reinicie a sessão.
 
 ---
 
-## 🧠 Segredos e Funcionamento do Hardware do Bloody A91
+## 🧠 Dicas de Hardware do Bloody A91
 
-### 1. Debounce Time (0.2 ms) e Memória On-Board (EEPROM)
-- O mouse Bloody A91 utiliza switches ópticos **Light Strike (LK)**, que não possuem o rebote mecânico das teclas convencionais.
-- O tempo de resposta de **0.2 ms** é gravado **diretamente no chip de memória flash (EEPROM) interno do mouse**.
-- **O que isso significa no Linux?** Se você alguma vez configurou o debounce time de 0.2 ms no software da Bloody no Windows (ou via máquina virtual), **ele já está salvo para sempre no hardware do mouse**. Não é necessário ter nenhum software rodando em segundo plano no Linux para desfrutar da velocidade máxima dos cliques!
+### Debounce Time (0.2 ms)
+Os switches ópticos **Light Strike (LK)** gravam o tempo de resposta na memória interna do mouse. Se você já configurou 0.2 ms no software oficial do Windows, ele continua valendo no Linux sem nenhum software rodando.
 
-### 2. Como Mudar o DPI Diretamente no Hardware (Sem Software)
-O Bloody A91 possui um recurso de hardware nativo para mudar o DPI:
-1. Dê um **duplo clique rápido no botão '1'** (acima da rodinha do mouse).
-2. O LED da rodinha de rolagem (scroll wheel) começará a piscar.
-3. **Role a rodinha para cima ou para baixo**: cada giro altera o perfil de DPI (indicado pela cor do LED).
-4. Dê **um único clique no botão '1'** para salvar o DPI na memória do mouse e sair do modo de ajuste!
+### Mudar o DPI direto no hardware
+1. Dê um **duplo clique rápido no botão '1'** (acima da rodinha).
+2. O LED da rodinha começa a piscar.
+3. **Role a rodinha** para alternar o perfil de DPI (indicado pela cor).
+4. **Clique uma vez no botão '1'** para salvar e sair.
 
 ---
 
-## 🛠️ Estrutura do Código
+## 🛠️ Estrutura
 
 ```
-bloody-linux/
-├── .vscode/
-│   ├── launch.json       # Configuração para rodar com F5
-│   └── settings.json     # Aponta o interpretador do VS Code para o venv
 ├── src/
-│   ├── config.py         # Gerenciamento de perfis e salvamento em JSON
-│   ├── hardware_usb.py   # Varredura de portas USB e controle de LEDs via PyUSB
-│   ├── input_engine.py   # Motor de interceptação evdev e uinput (No-recoil e burst)
-│   └── gui.py            # Interface gráfica gamer (CustomTkinter com fallback Tkinter)
-├── main.py               # Ponto de entrada da aplicação
-├── requirements.txt      # Dependências Python
-├── 99-bloody.rules       # Regras udev para Linux
-└── setup.sh              # Script automatizado de instalação
+│   ├── config.py           # Configurações (~/.config/bloodylinux), merge e salvamento
+│   ├── hardware_usb.py     # Detecção USB e controle de LEDs (PyUSB)
+│   ├── input_engine.py     # Captura evdev + mouse virtual uinput (recoil, rajada, auto-click)
+│   └── gui.py              # Interface CustomTkinter (com fallback em Tk puro)
+├── main.py                 # Ponto de entrada
+├── install.sh / uninstall.sh
+├── 70-bloodylinux.rules    # Regras udev
+├── packaging/              # build-deb.sh, ícone e atalho .desktop
+├── setup.sh                # Ambiente de desenvolvimento
+└── .github/workflows/      # Build automático do .deb e .tar.gz
 ```
